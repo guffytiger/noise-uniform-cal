@@ -5,6 +5,9 @@
   "scripts": {
     "dev": "next dev",
     "build": "next build",
+    "build:desktop:web": "node scripts/build-desktop.mjs",
+    "desktop:dev": "yarn --cwd desktop dev",
+    "desktop:build": "node scripts/build-desktop-app.mjs",
     "start": "next start",
     "lint": "eslint"
   },

@@ -16,6 +16,10 @@
 # next.js
 /.next/
 /out/
+/desktop-dist/
+/desktop/node_modules/
+/desktop/src-tauri/target/
+/desktop-release/
 
 # production
 /build
