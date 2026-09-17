@@ -28,7 +28,7 @@ type BluetoothDeviceLike = {
 declare global {
   interface Navigator {
     serial?: { requestPort: () => Promise<SerialPortLike>; getPorts: () => Promise<SerialPortLike[]> };
-    bluetooth?: { requestDevice: (options: { acceptAllDevices: boolean; optionalServices?: string[] }) => Promise<BluetoothDeviceLike> };
+    bluetooth?: { requestDevice: (options: { acceptAllDevices: boolean; optionalServices?: string[] }) => Promise<BluetoothDeviceLike>; getDevices?: () => Promise<BluetoothDeviceLike[]> };
   }
 }
 
@@ -127,6 +127,7 @@ export default function Home() {
   const serialPortRef = useRef<SerialPortLike | null>(null);
   const serialReaderRef = useRef<ReadableStreamDefaultReader<Uint8Array> | null>(null);
   const bluetoothDeviceRef = useRef<BluetoothDeviceLike | null>(null);
+  const knownBluetoothDevicesRef = useRef<BluetoothDeviceLike[]>([]);
   const bluetoothCharacteristicRef = useRef<BluetoothCharacteristicLike | null>(null);
   const stopSerialRef = useRef(false);
   const [meter, setMeter] = useState<Meter>("RTI Piranha");
@@ -137,6 +138,7 @@ export default function Home() {
   const [characteristicUuid, setCharacteristicUuid] = useState("");
   const [knownPortCount, setKnownPortCount] = useState<number | null>(null);
   const [bluetoothDeviceName, setBluetoothDeviceName] = useState("");
+  const [knownBluetoothNames, setKnownBluetoothNames] = useState<string[]>([]);
   const [meterStatus, setMeterStatus] = useState<"idle" | "reading" | "connected" | "error">("idle");
   const [meterMessage, setMeterMessage] = useState("เลือกมิเตอร์ แล้วนำเข้าผลหรือเชื่อมต่อ Web Serial");
   const [factor, setFactor] = useState("0.95");
@@ -228,12 +230,12 @@ export default function Home() {
       await connectSerial(ports[0]);
     } catch (e) { setMeterStatus("error"); setMeterMessage(e instanceof Error ? e.message : "ค้นหาพอร์ตไม่สำเร็จ"); }
   }
-  async function connectBluetooth() {
+  async function connectBluetooth(existingDevice?: BluetoothDeviceLike) {
     if (!navigator.bluetooth) { setMeterStatus("error"); setMeterMessage("เบราว์เซอร์นี้ไม่รองรับ Web Bluetooth — ใช้ Chrome/Edge หรือจับคู่ Bluetooth เป็น COM port แล้วเลือก Web Serial"); return; }
     try {
-      setMeterStatus("reading"); setMeterMessage("กำลังรอเลือกอุปกรณ์ Bluetooth…");
+      setMeterStatus("reading"); setMeterMessage(existingDevice ? "กำลังเชื่อมต่ออุปกรณ์ที่เคยอนุญาต…" : "กำลังรอเพิ่มอุปกรณ์ Bluetooth ใหม่…");
       const hasUuids = Boolean(serviceUuid.trim() && characteristicUuid.trim());
-      const device = await navigator.bluetooth.requestDevice({ acceptAllDevices: true, ...(hasUuids ? { optionalServices: [serviceUuid.trim()] } : {}) });
+      const device = existingDevice ?? await navigator.bluetooth.requestDevice({ acceptAllDevices: true, ...(hasUuids ? { optionalServices: [serviceUuid.trim()] } : {}) });
       if (!device.gatt) throw new Error("อุปกรณ์ไม่มีบริการ GATT");
       bluetoothDeviceRef.current = device; setBluetoothDeviceName(device.name ?? "Unknown BLE device");
       const server = await device.gatt.connect();
@@ -262,6 +264,17 @@ export default function Home() {
       setMeterStatus(cancelled ? "idle" : "error");
       setMeterMessage(cancelled ? "ไม่ได้เลือกอุปกรณ์ Bluetooth หรือไม่มีอุปกรณ์ BLE กำลัง advertise" : e instanceof Error ? e.message : "เชื่อมต่อ Bluetooth ไม่สำเร็จ");
     }
+  }
+  async function queryKnownBluetoothDevices() {
+    if (!navigator.bluetooth?.getDevices) { setMeterStatus("error"); setMeterMessage("Chrome รุ่นนี้ไม่รองรับรายการอุปกรณ์ที่เคยอนุญาต กรุณาอัปเดต Chrome"); return; }
+    try {
+      setMeterStatus("reading"); setMeterMessage("กำลังอ่านอุปกรณ์ Bluetooth ที่เว็บนี้เคยได้รับอนุญาต…");
+      const devices = await navigator.bluetooth.getDevices();
+      knownBluetoothDevicesRef.current = devices;
+      setKnownBluetoothNames(devices.map((device, index) => device.name ?? `อุปกรณ์ ${index + 1}`));
+      setMeterStatus("idle");
+      setMeterMessage(devices.length ? `พบ ${devices.length} อุปกรณ์ที่เคยอนุญาต — เลือกอุปกรณ์ด้านล่าง` : "ยังไม่มีอุปกรณ์ที่เคยอนุญาตให้เว็บนี้ กด ‘เพิ่มอุปกรณ์ใหม่’ หนึ่งครั้ง");
+    } catch (e) { setMeterStatus("error"); setMeterMessage(e instanceof Error ? e.message : "อ่านรายการ Bluetooth ไม่สำเร็จ"); }
   }
   async function startSession() {
     if (!sessionName.trim()) { setMeterStatus("error"); setMeterMessage("กรุณาตั้งชื่อ session"); return; }
@@ -297,7 +310,7 @@ export default function Home() {
             <div className="session-fields"><div><label className="label" htmlFor="session-name">ชื่อ Session</label><input id="session-name" className="input" value={sessionName} onChange={(e) => setSessionName(e.target.value)} placeholder="QA Session"/></div><div><label className="label" htmlFor="meter">มิเตอร์</label><select id="meter" className="input" value={meter} onChange={(e) => setMeter(e.target.value as Meter)}><option>RTI Piranha</option><option>ACCU-GOLD2</option></select></div></div>
             <div><span className="label">การเชื่อมต่อ</span><div className="transport-tabs"><button className={transport === "bluetooth" ? "active" : ""} onClick={() => setTransport("bluetooth")}>1. Bluetooth (BLE)</button><button className={transport === "serial" ? "active" : ""} onClick={() => setTransport("serial")}>2. Serial / Bluetooth COM</button></div></div>
             {transport === "serial" ? <div><label className="label" htmlFor="baud-rate">Baud rate</label><select id="baud-rate" className="input" value={baudRate} onChange={(e) => setBaudRate(e.target.value)}><option>9600</option><option>19200</option><option>38400</option><option>57600</option><option>115200</option></select><p className="field-note">สำหรับ USB หรือ Bluetooth Classic/SPP ที่ Windows แสดงเป็น COM port</p></div> : <div className="ble-fields">{bluetoothDeviceName && <div className="selected-device"><span>อุปกรณ์ที่เลือก</span><strong>{bluetoothDeviceName}</strong></div>}<div><label className="label" htmlFor="service-uuid">Service UUID <small>(ไม่บังคับสำหรับการค้นหา)</small></label><input id="service-uuid" className="input mono" value={serviceUuid} onChange={(e) => setServiceUuid(e.target.value)} placeholder="0000xxxx-0000-1000-8000-00805f9b34fb"/></div><div><label className="label" htmlFor="characteristic-uuid">Notify Characteristic UUID <small>(ไม่บังคับสำหรับการค้นหา)</small></label><input id="characteristic-uuid" className="input mono" value={characteristicUuid} onChange={(e) => setCharacteristicUuid(e.target.value)} placeholder="0000xxxx-0000-1000-8000-00805f9b34fb"/></div><p className="field-note">กดค้นหาได้ทันทีโดยไม่กรอก UUID; UUID จำเป็นเมื่อต้องรับข้อมูลการวัดผ่าน GATT notification</p></div>}
-            {transport === "serial" ? <div className="serial-actions"><button className="button button-primary" onClick={querySerialPorts} disabled={meterStatus === "reading" || meterStatus === "connected"}><Icon name="plug"/>สแกนพอร์ตที่อนุญาต</button><button className="button" onClick={startSession} disabled={meterStatus === "reading" || meterStatus === "connected"}>อนุญาตพอร์ตใหม่</button><span>{knownPortCount === null ? "ยังไม่ได้สแกน" : `พบ ${knownPortCount} พอร์ต`}</span></div> : <button className="button button-primary full-button" onClick={startSession} disabled={meterStatus === "reading" || meterStatus === "connected"}><Icon name="plug"/>ค้นหาอุปกรณ์ BLE</button>}
+            {transport === "serial" ? <div className="serial-actions"><button className="button button-primary" onClick={querySerialPorts} disabled={meterStatus === "reading" || meterStatus === "connected"}><Icon name="plug"/>สแกนพอร์ตที่อนุญาต</button><button className="button" onClick={startSession} disabled={meterStatus === "reading" || meterStatus === "connected"}>อนุญาตพอร์ตใหม่</button><span>{knownPortCount === null ? "ยังไม่ได้สแกน" : `พบ ${knownPortCount} พอร์ต`}</span></div> : <div className="bluetooth-actions"><div className="action-grid"><button className="button button-primary" onClick={queryKnownBluetoothDevices} disabled={meterStatus === "reading" || meterStatus === "connected"}><Icon name="plug"/>อุปกรณ์ที่เคยเชื่อม</button><button className="button" onClick={startSession} disabled={meterStatus === "reading" || meterStatus === "connected"}>เพิ่มอุปกรณ์ใหม่</button></div>{knownBluetoothNames.length > 0 && <div className="known-devices">{knownBluetoothNames.map((name, index) => <button key={`${name}-${index}`} onClick={() => connectBluetooth(knownBluetoothDevicesRef.current[index])} disabled={meterStatus === "reading" || meterStatus === "connected"}><span className="connection-dot"/><span><strong>{name}</strong><small>เคยอนุญาตให้เว็บนี้</small></span></button>)}</div>}</div>}
             <button className="button full-button" onClick={() => meterFileRef.current?.click()}><Icon name="upload"/>นำเข้า CSV/TXT</button><input ref={meterFileRef} className="hidden" type="file" accept=".csv,.txt,text/csv,text/plain" onChange={(e) => handleMeterFile(e.target.files?.[0])}/>
             {meterStatus === "connected" && <button className="button button-danger" onClick={disconnectSerial}>หยุด Session และตัดการเชื่อมต่อ</button>}
             <div className={`connection ${meterStatus}`}><span className="connection-dot"/><div><strong>{meterStatus === "connected" ? "พร้อมรับข้อมูล" : meterStatus === "reading" ? "กำลังเชื่อมต่อ" : meterStatus === "error" ? "ต้องตรวจสอบ" : "ยังไม่เชื่อมต่อ"}</strong><p>{meterMessage}</p></div></div>
