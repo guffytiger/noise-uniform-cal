@@ -27,8 +27,8 @@ type BluetoothDeviceLike = {
 
 declare global {
   interface Navigator {
-    serial?: { requestPort: () => Promise<SerialPortLike> };
-    bluetooth?: { requestDevice: (options: { acceptAllDevices: boolean; optionalServices: string[] }) => Promise<BluetoothDeviceLike> };
+    serial?: { requestPort: () => Promise<SerialPortLike>; getPorts: () => Promise<SerialPortLike[]> };
+    bluetooth?: { requestDevice: (options: { acceptAllDevices: boolean; optionalServices?: string[] }) => Promise<BluetoothDeviceLike> };
   }
 }
 
@@ -130,11 +130,13 @@ export default function Home() {
   const bluetoothCharacteristicRef = useRef<BluetoothCharacteristicLike | null>(null);
   const stopSerialRef = useRef(false);
   const [meter, setMeter] = useState<Meter>("RTI Piranha");
-  const [transport, setTransport] = useState<"serial" | "bluetooth">("serial");
+  const [transport, setTransport] = useState<"serial" | "bluetooth">("bluetooth");
   const [sessionName, setSessionName] = useState("QA Session 1");
   const [baudRate, setBaudRate] = useState("115200");
   const [serviceUuid, setServiceUuid] = useState("");
   const [characteristicUuid, setCharacteristicUuid] = useState("");
+  const [knownPortCount, setKnownPortCount] = useState<number | null>(null);
+  const [bluetoothDeviceName, setBluetoothDeviceName] = useState("");
   const [meterStatus, setMeterStatus] = useState<"idle" | "reading" | "connected" | "error">("idle");
   const [meterMessage, setMeterMessage] = useState("เลือกมิเตอร์ แล้วนำเข้าผลหรือเชื่อมต่อ Web Serial");
   const [factor, setFactor] = useState("0.95");
@@ -185,11 +187,11 @@ export default function Home() {
     catch (e) { setMeterStatus("error"); setMeterMessage(e instanceof Error ? e.message : "อ่านไฟล์ไม่สำเร็จ"); }
     finally { if (meterFileRef.current) meterFileRef.current.value = ""; }
   }
-  async function connectSerial() {
+  async function connectSerial(existingPort?: SerialPortLike) {
     if (!navigator.serial) { setMeterStatus("error"); setMeterMessage("เบราว์เซอร์นี้ไม่รองรับ Web Serial — ใช้ Chrome/Edge หรือส่งออก CSV จากซอฟต์แวร์มิเตอร์"); return; }
     try {
       setMeterStatus("reading"); setMeterMessage("กำลังรอเลือกพอร์ต…"); stopSerialRef.current = false;
-      const port = await navigator.serial.requestPort(); serialPortRef.current = port;
+      const port = existingPort ?? await navigator.serial.requestPort(); serialPortRef.current = port;
       const baud = Number(baudRate);
       if (!Number.isInteger(baud) || baud <= 0) throw new Error("Baud rate ไม่ถูกต้อง");
       await port.open({ baudRate: baud }); setMeterStatus("connected"); setMeterMessage(`${sessionName}: เชื่อมต่อ ${meter} ผ่าน Web Serial แล้ว`);
@@ -205,17 +207,41 @@ export default function Home() {
         }
       }
       reader.releaseLock(); serialReaderRef.current = null;
-    } catch (e) { setMeterStatus("error"); setMeterMessage(e instanceof Error ? e.message : "เชื่อมต่อมิเตอร์ไม่สำเร็จ"); }
+    } catch (e) {
+      const cancelled = e instanceof DOMException && (e.name === "NotFoundError" || /No Port Selected/i.test(e.message));
+      const onAndroid = /Android/i.test(navigator.userAgent);
+      setMeterStatus(cancelled ? "idle" : "error");
+      setMeterMessage(cancelled ? (onAndroid ? "ไม่ได้เลือกพอร์ต — บน Z Fold 5 ให้ต่อสาย USB-OTG, เปิดมิเตอร์ แล้วลองใหม่ หรือใช้ BLE หากมิเตอร์รองรับ" : "ยกเลิกการเลือกพอร์ต หรือไม่พบพอร์ตที่รองรับ") : e instanceof Error ? e.message : "เชื่อมต่อมิเตอร์ไม่สำเร็จ");
+    }
+  }
+  async function querySerialPorts() {
+    if (!navigator.serial) { setMeterStatus("error"); setMeterMessage("เบราว์เซอร์นี้ไม่รองรับ Web Serial"); return; }
+    try {
+      setMeterStatus("reading"); setMeterMessage("กำลังค้นหาพอร์ตที่เคยอนุญาต…");
+      const ports = await navigator.serial.getPorts(); setKnownPortCount(ports.length);
+      if (!ports.length) {
+        setMeterStatus("idle");
+        setMeterMessage("ไม่พบพอร์ตที่ได้รับอนุญาต — เสียบ USB-OTG แล้วกด ‘อนุญาตพอร์ตใหม่’ อย่างน้อยหนึ่งครั้ง");
+        return;
+      }
+      setMeterMessage(`พบ ${ports.length} พอร์ตที่ได้รับอนุญาต กำลังเชื่อมต่อพอร์ตแรก…`);
+      await connectSerial(ports[0]);
+    } catch (e) { setMeterStatus("error"); setMeterMessage(e instanceof Error ? e.message : "ค้นหาพอร์ตไม่สำเร็จ"); }
   }
   async function connectBluetooth() {
     if (!navigator.bluetooth) { setMeterStatus("error"); setMeterMessage("เบราว์เซอร์นี้ไม่รองรับ Web Bluetooth — ใช้ Chrome/Edge หรือจับคู่ Bluetooth เป็น COM port แล้วเลือก Web Serial"); return; }
-    if (!serviceUuid.trim() || !characteristicUuid.trim()) { setMeterStatus("error"); setMeterMessage("กรุณาระบุ Service UUID และ Notify Characteristic UUID จากคู่มือ/SDK ของมิเตอร์"); return; }
     try {
       setMeterStatus("reading"); setMeterMessage("กำลังรอเลือกอุปกรณ์ Bluetooth…");
-      const device = await navigator.bluetooth.requestDevice({ acceptAllDevices: true, optionalServices: [serviceUuid.trim()] });
+      const hasUuids = Boolean(serviceUuid.trim() && characteristicUuid.trim());
+      const device = await navigator.bluetooth.requestDevice({ acceptAllDevices: true, ...(hasUuids ? { optionalServices: [serviceUuid.trim()] } : {}) });
       if (!device.gatt) throw new Error("อุปกรณ์ไม่มีบริการ GATT");
-      bluetoothDeviceRef.current = device;
+      bluetoothDeviceRef.current = device; setBluetoothDeviceName(device.name ?? "Unknown BLE device");
       const server = await device.gatt.connect();
+      if (!hasUuids) {
+        setMeterStatus("connected");
+        setMeterMessage(`${sessionName}: พบและเชื่อมต่อ ${device.name ?? "อุปกรณ์ BLE"} แล้ว — กรอก UUID เพื่อเปิดรับค่าการวัด`);
+        return;
+      }
       const service = await server.getPrimaryService(serviceUuid.trim());
       const characteristic = await service.getCharacteristic(characteristicUuid.trim());
       bluetoothCharacteristicRef.current = characteristic;
@@ -231,7 +257,11 @@ export default function Home() {
       });
       await characteristic.startNotifications();
       setMeterStatus("connected"); setMeterMessage(`${sessionName}: เชื่อมต่อ ${device.name ?? meter} ผ่าน Web Bluetooth แล้ว`);
-    } catch (e) { setMeterStatus("error"); setMeterMessage(e instanceof Error ? e.message : "เชื่อมต่อ Bluetooth ไม่สำเร็จ"); }
+    } catch (e) {
+      const cancelled = e instanceof DOMException && (e.name === "NotFoundError" || /cancel|not found/i.test(e.message));
+      setMeterStatus(cancelled ? "idle" : "error");
+      setMeterMessage(cancelled ? "ไม่ได้เลือกอุปกรณ์ Bluetooth หรือไม่มีอุปกรณ์ BLE กำลัง advertise" : e instanceof Error ? e.message : "เชื่อมต่อ Bluetooth ไม่สำเร็จ");
+    }
   }
   async function startSession() {
     if (!sessionName.trim()) { setMeterStatus("error"); setMeterMessage("กรุณาตั้งชื่อ session"); return; }
@@ -243,7 +273,7 @@ export default function Home() {
     try { await serialPortRef.current?.close(); } catch { /* port may already be closed */ }
     serialReaderRef.current = null; serialPortRef.current = null;
     try { await bluetoothCharacteristicRef.current?.stopNotifications(); } catch { /* notifications may already be stopped */ }
-    bluetoothDeviceRef.current?.gatt?.disconnect(); bluetoothCharacteristicRef.current = null; bluetoothDeviceRef.current = null;
+    bluetoothDeviceRef.current?.gatt?.disconnect(); bluetoothCharacteristicRef.current = null; bluetoothDeviceRef.current = null; setBluetoothDeviceName("");
     setMeterStatus("idle"); setMeterMessage(`${sessionName}: สิ้นสุด session แล้ว`);
   }
 
@@ -265,11 +295,13 @@ export default function Home() {
         <section className="meter-grid">
           <div className="card"><div className="card-header"><h2>สร้าง Session เชื่อมต่อมิเตอร์</h2><p>RTI Piranha และ ACCU-GOLD2 ผ่าน Serial หรือ Bluetooth</p></div><div className="card-body space-y-4">
             <div className="session-fields"><div><label className="label" htmlFor="session-name">ชื่อ Session</label><input id="session-name" className="input" value={sessionName} onChange={(e) => setSessionName(e.target.value)} placeholder="QA Session"/></div><div><label className="label" htmlFor="meter">มิเตอร์</label><select id="meter" className="input" value={meter} onChange={(e) => setMeter(e.target.value as Meter)}><option>RTI Piranha</option><option>ACCU-GOLD2</option></select></div></div>
-            <div><span className="label">การเชื่อมต่อ</span><div className="transport-tabs"><button className={transport === "serial" ? "active" : ""} onClick={() => setTransport("serial")}>Web Serial / Bluetooth COM</button><button className={transport === "bluetooth" ? "active" : ""} onClick={() => setTransport("bluetooth")}>Web Bluetooth (BLE)</button></div></div>
-            {transport === "serial" ? <div><label className="label" htmlFor="baud-rate">Baud rate</label><select id="baud-rate" className="input" value={baudRate} onChange={(e) => setBaudRate(e.target.value)}><option>9600</option><option>19200</option><option>38400</option><option>57600</option><option>115200</option></select><p className="field-note">สำหรับ USB หรือ Bluetooth Classic/SPP ที่ Windows แสดงเป็น COM port</p></div> : <div className="ble-fields"><div><label className="label" htmlFor="service-uuid">Service UUID</label><input id="service-uuid" className="input mono" value={serviceUuid} onChange={(e) => setServiceUuid(e.target.value)} placeholder="0000xxxx-0000-1000-8000-00805f9b34fb"/></div><div><label className="label" htmlFor="characteristic-uuid">Notify Characteristic UUID</label><input id="characteristic-uuid" className="input mono" value={characteristicUuid} onChange={(e) => setCharacteristicUuid(e.target.value)} placeholder="0000xxxx-0000-1000-8000-00805f9b34fb"/></div><p className="field-note">BLE ต้องใช้ UUID จากเอกสาร SDK/โปรโตคอลของผู้ผลิต</p></div>}
-            <div className="action-grid"><button className="button button-primary" onClick={startSession} disabled={meterStatus === "reading" || meterStatus === "connected"}><Icon name="plug"/>เริ่ม Session</button><button className="button" onClick={() => meterFileRef.current?.click()}><Icon name="upload"/>นำเข้า CSV/TXT</button><input ref={meterFileRef} className="hidden" type="file" accept=".csv,.txt,text/csv,text/plain" onChange={(e) => handleMeterFile(e.target.files?.[0])}/></div>
+            <div><span className="label">การเชื่อมต่อ</span><div className="transport-tabs"><button className={transport === "bluetooth" ? "active" : ""} onClick={() => setTransport("bluetooth")}>1. Bluetooth (BLE)</button><button className={transport === "serial" ? "active" : ""} onClick={() => setTransport("serial")}>2. Serial / Bluetooth COM</button></div></div>
+            {transport === "serial" ? <div><label className="label" htmlFor="baud-rate">Baud rate</label><select id="baud-rate" className="input" value={baudRate} onChange={(e) => setBaudRate(e.target.value)}><option>9600</option><option>19200</option><option>38400</option><option>57600</option><option>115200</option></select><p className="field-note">สำหรับ USB หรือ Bluetooth Classic/SPP ที่ Windows แสดงเป็น COM port</p></div> : <div className="ble-fields">{bluetoothDeviceName && <div className="selected-device"><span>อุปกรณ์ที่เลือก</span><strong>{bluetoothDeviceName}</strong></div>}<div><label className="label" htmlFor="service-uuid">Service UUID <small>(ไม่บังคับสำหรับการค้นหา)</small></label><input id="service-uuid" className="input mono" value={serviceUuid} onChange={(e) => setServiceUuid(e.target.value)} placeholder="0000xxxx-0000-1000-8000-00805f9b34fb"/></div><div><label className="label" htmlFor="characteristic-uuid">Notify Characteristic UUID <small>(ไม่บังคับสำหรับการค้นหา)</small></label><input id="characteristic-uuid" className="input mono" value={characteristicUuid} onChange={(e) => setCharacteristicUuid(e.target.value)} placeholder="0000xxxx-0000-1000-8000-00805f9b34fb"/></div><p className="field-note">กดค้นหาได้ทันทีโดยไม่กรอก UUID; UUID จำเป็นเมื่อต้องรับข้อมูลการวัดผ่าน GATT notification</p></div>}
+            {transport === "serial" ? <div className="serial-actions"><button className="button button-primary" onClick={querySerialPorts} disabled={meterStatus === "reading" || meterStatus === "connected"}><Icon name="plug"/>สแกนพอร์ตที่อนุญาต</button><button className="button" onClick={startSession} disabled={meterStatus === "reading" || meterStatus === "connected"}>อนุญาตพอร์ตใหม่</button><span>{knownPortCount === null ? "ยังไม่ได้สแกน" : `พบ ${knownPortCount} พอร์ต`}</span></div> : <button className="button button-primary full-button" onClick={startSession} disabled={meterStatus === "reading" || meterStatus === "connected"}><Icon name="plug"/>ค้นหาอุปกรณ์ BLE</button>}
+            <button className="button full-button" onClick={() => meterFileRef.current?.click()}><Icon name="upload"/>นำเข้า CSV/TXT</button><input ref={meterFileRef} className="hidden" type="file" accept=".csv,.txt,text/csv,text/plain" onChange={(e) => handleMeterFile(e.target.files?.[0])}/>
             {meterStatus === "connected" && <button className="button button-danger" onClick={disconnectSerial}>หยุด Session และตัดการเชื่อมต่อ</button>}
             <div className={`connection ${meterStatus}`}><span className="connection-dot"/><div><strong>{meterStatus === "connected" ? "พร้อมรับข้อมูล" : meterStatus === "reading" ? "กำลังเชื่อมต่อ" : meterStatus === "error" ? "ต้องตรวจสอบ" : "ยังไม่เชื่อมต่อ"}</strong><p>{meterMessage}</p></div></div>
+            {transport === "serial" && <div className="mobile-note"><strong>Samsung Galaxy Z Fold 5 / Android</strong><span>USB Serial ต้องใช้ Chrome รุ่นที่รองรับ, หน้าเว็บ HTTPS และสาย USB-OTG แบบรับส่งข้อมูล หากไม่พบพอร์ต ให้เปิดมิเตอร์และเสียบสายก่อนกดเริ่ม Session; อุปกรณ์ BLE ให้เลือก Web Bluetooth</span></div>}
             <p className="helper">รองรับข้อความรูปแบบหัวตาราง CSV/TSV หรือบรรทัด เช่น <code>kV=89.6, time=18.29, dose=3.065, HVL=5.61</code></p>
           </div></div>
           <div className="card current-panel"><div className="card-header"><h2>ค่าปัจจุบัน</h2><p>{current ? `${current.source ?? meter} • ${current.capturedAt ? new Date(current.capturedAt).toLocaleTimeString("th-TH") : "แก้ไขด้วยตนเอง"}` : "รอข้อมูลจากมิเตอร์"}</p></div><div className="card-body">
