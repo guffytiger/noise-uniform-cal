@@ -6,6 +6,8 @@ type Roi = { area: number; mean: number; stdDev: number; min: number; max: numbe
 type DoseField = "kv" | "scanTime" | "dose" | "hvl";
 type DoseRow = Record<DoseField, string> & { source?: string; capturedAt?: string };
 type Meter = "RTI Piranha" | "ACCU-GOLD2";
+type LightMode = "luminance" | "illuminance" | "ambient";
+type LightSample = { value: number; at: number };
 type SerialPortLike = {
   open: (options: { baudRate: number }) => Promise<void>;
   close: () => Promise<void>;
@@ -119,9 +121,21 @@ const bluetoothLabel = (device: BluetoothDeviceLike, meter: Meter, index?: numbe
   const suffix = device.id?.slice(-6) || (index !== undefined ? String(index + 1) : "—");
   return device.name?.trim() || `${meter} • ID ${suffix}`;
 };
+const wait = (milliseconds: number) => new Promise((resolve) => setTimeout(resolve, milliseconds));
+const lightModes: Array<{ value: LightMode; label: string; unit: string; description: string }> = [
+  { value: "luminance", label: "Luminance — Monitor", unit: "cd/m²", description: "ความสว่างของจอภาพ" },
+  { value: "illuminance", label: "Illuminance — Light source", unit: "lx", description: "ความส่องสว่างจากแหล่งกำเนิดแสง" },
+  { value: "ambient", label: "Ambient light", unit: "lx", description: "แสงแวดล้อมด้วย lux adapter" },
+];
+function parseLightValue(line: string) {
+  const match = line.match(/(?:luminance|illuminance|ambient|light|lux|cd\/m2|cd\/m²|value)\s*[:=,]\s*([+-]?\d+(?:[.,]\d+)?)/i);
+  if (!match) return null;
+  const value = toNumber(match[1]);
+  return Number.isFinite(value) && value >= 0 ? value : null;
+}
 
 export default function Home() {
-  const [tab, setTab] = useState<"uniform" | "dose">("dose");
+  const [tab, setTab] = useState<"uniform" | "dose" | "light">("dose");
   const [mode, setMode] = useState(modes[1].value);
   const [rois, setRois] = useState<Roi[]>([]);
   const [fileName, setFileName] = useState("");
@@ -144,6 +158,9 @@ export default function Home() {
   const [knownPortCount, setKnownPortCount] = useState<number | null>(null);
   const [bluetoothDeviceName, setBluetoothDeviceName] = useState("");
   const [knownBluetoothNames, setKnownBluetoothNames] = useState<string[]>([]);
+  const [lightMode, setLightMode] = useState<LightMode>("luminance");
+  const [lightSamples, setLightSamples] = useState<LightSample[]>([]);
+  const [lightRecording, setLightRecording] = useState(true);
   const [meterStatus, setMeterStatus] = useState<"idle" | "reading" | "connected" | "error">("idle");
   const [meterMessage, setMeterMessage] = useState("เลือกมิเตอร์ แล้วนำเข้าผลหรือเชื่อมต่อ Web Serial");
   const [factor, setFactor] = useState("0.95");
@@ -168,6 +185,15 @@ export default function Home() {
     const metric = (items: number[], limit: number) => ({ mean: avg(items), sd: sampleSd(items), cv: 100 * sampleSd(items) / avg(items), limit });
     return { calibratedKv, kv: metric(calibratedKv, 2), scan: metric(values("scanTime"), 5), dose: metric(values("dose"), 5), hvlMean: avg(values("hvl")), hvlPass: values("hvl").every((value) => value > 2.5) };
   }, [validRows, factor]);
+  const lightStats = useMemo(() => {
+    const values = lightSamples.map((sample) => sample.value);
+    return values.length ? { current: values.at(-1)!, min: Math.min(...values), max: Math.max(...values), mean: avg(values) } : null;
+  }, [lightSamples]);
+  function ingestStreamLine(line: string, source: string) {
+    const light = parseLightValue(line);
+    if (light !== null && lightRecording) setLightSamples((samples) => [...samples, { value: light, at: Date.now() }].slice(-300));
+    try { const rows = parseMeterText(line, meter); if (rows.length) addMeasurements(rows, source); } catch { /* line may contain light data only */ }
+  }
 
   async function handleFile(file?: File) {
     if (!file) return; setError("");
@@ -210,7 +236,7 @@ export default function Home() {
         const { value, done } = await reader.read(); if (done) break; buffer += decoder.decode(value, { stream: true });
         const lines = buffer.split(/\r?\n/); buffer = lines.pop() ?? "";
         for (const line of lines) {
-          try { const rows = parseMeterText(line, meter); if (rows.length) addMeasurements(rows, meter); } catch { /* wait for a complete record */ }
+          ingestStreamLine(line, meter);
         }
       }
       reader.releaseLock(); serialReaderRef.current = null;
@@ -248,10 +274,20 @@ export default function Home() {
       const prefixes = meter === "RTI Piranha" ? ["Piranha", "RTI"] : ["ACCU", "Accu", "Radcal", "AG2"];
       const discovery = filterByMeter ? { filters: prefixes.map((namePrefix) => ({ namePrefix })) } : { acceptAllDevices: true };
       const device = existingDevice ?? await navigator.bluetooth.requestDevice({ ...discovery, ...(hasUuids ? { optionalServices: [serviceUuid.trim()] } : {}) });
-      if (!device.gatt) throw new Error("อุปกรณ์ไม่มีบริการ GATT");
+      if (!device.gatt) throw new Error("อุปกรณ์ไม่มี Bluetooth GATT — น่าจะเป็น Bluetooth Classic/SPP ซึ่ง Web Bluetooth เชื่อมต่อไม่ได้");
       const visibleName = bluetoothLabel(device, meter);
       bluetoothDeviceRef.current = device; setBluetoothDeviceName(visibleName);
-      const server = await device.gatt.connect();
+      let server: Awaited<ReturnType<NonNullable<BluetoothDeviceLike["gatt"]>["connect"]>> | null = null;
+      let lastGattError: unknown;
+      for (let attempt = 1; attempt <= 3; attempt += 1) {
+        try {
+          if (device.gatt.connected) device.gatt.disconnect();
+          if (attempt > 1) { setMeterMessage(`กำลังเชื่อมต่อ ${visibleName} ใหม่ ครั้งที่ ${attempt}/3…`); await wait(attempt * 500); }
+          server = await device.gatt.connect();
+          break;
+        } catch (error) { lastGattError = error; }
+      }
+      if (!server) throw lastGattError instanceof Error ? lastGattError : new Error("เชื่อมต่อ GATT ไม่สำเร็จหลังลอง 3 ครั้ง");
       if (!hasUuids) {
         setMeterStatus("connected");
         setMeterMessage(`${sessionName}: พบและเชื่อมต่อ ${visibleName} แล้ว — กรอก UUID เพื่อเปิดรับค่าการวัด`);
@@ -267,7 +303,7 @@ export default function Home() {
         buffer += decoder.decode(new Uint8Array(value.buffer, value.byteOffset, value.byteLength), { stream: true });
         const lines = buffer.split(/\r?\n/); buffer = lines.pop() ?? "";
         for (const line of lines) {
-          try { const rows = parseMeterText(line, meter); if (rows.length) addMeasurements(rows, `${meter} Bluetooth`); } catch { /* wait for a complete record */ }
+          ingestStreamLine(line, `${meter} Bluetooth`);
         }
       });
       await characteristic.startNotifications();
@@ -275,7 +311,13 @@ export default function Home() {
     } catch (e) {
       const cancelled = e instanceof DOMException && (e.name === "NotFoundError" || /cancel|not found/i.test(e.message));
       setMeterStatus(cancelled ? "idle" : "error");
-      setMeterMessage(cancelled ? "ไม่ได้เลือกอุปกรณ์ Bluetooth หรือไม่มีอุปกรณ์ BLE กำลัง advertise" : e instanceof Error ? e.message : "เชื่อมต่อ Bluetooth ไม่สำเร็จ");
+      const message = e instanceof Error ? e.message : "เชื่อมต่อ Bluetooth ไม่สำเร็จ";
+      const friendly = /gatt.*disconnect|networkerror/i.test(message)
+        ? "เชื่อมต่อ GATT ไม่สำเร็จหลังลอง 3 ครั้ง — ปิด Ocean/Accu‑Gold หรือแอปอื่นที่ต่อมิเตอร์อยู่ แล้วปิด–เปิด Bluetooth ของมือถือและมิเตอร์"
+        : /service|uuid|characteristic/i.test(message)
+          ? "เชื่อมต่ออุปกรณ์ได้ แต่ไม่พบบริการวัดค่า — ตรวจสอบ Service UUID และ Notify Characteristic UUID จาก SDK ของผู้ผลิต"
+          : message;
+      setMeterMessage(cancelled ? "ไม่ได้เลือกอุปกรณ์ Bluetooth หรือไม่มีอุปกรณ์ BLE กำลัง advertise" : friendly);
     }
   }
   async function queryKnownBluetoothDevices() {
@@ -318,7 +360,7 @@ export default function Home() {
   return <div className="min-h-screen bg-muted text-foreground">
     <header className="border-b bg-card"><div className="mx-auto flex max-w-7xl items-center gap-3 px-4 py-4 sm:px-6"><div className="grid size-10 place-items-center rounded-lg bg-primary text-primary-foreground"><Icon name="flask" size={21}/></div><div><h1 className="text-base font-semibold leading-tight">Radiography QA Calculator</h1><p className="text-sm text-muted-foreground">รับค่าจากมิเตอร์ แสดงกราฟ และคำนวณตามแบบฟอร์มอ้างอิง</p></div></div></header>
     <main className="mx-auto max-w-7xl px-4 py-6 sm:px-6 sm:py-8">
-      <div className="mb-6 grid w-full grid-cols-2 rounded-lg bg-secondary p-1 sm:w-[360px]" role="tablist"><button onClick={() => setTab("uniform")} className={`tab ${tab === "uniform" ? "tab-active" : ""}`}>Uniform &amp; Noise</button><button onClick={() => setTab("dose")} className={`tab ${tab === "dose" ? "tab-active" : ""}`}>Meter &amp; Dose</button></div>
+      <div className="mb-6 grid w-full grid-cols-3 rounded-lg bg-secondary p-1 sm:w-[560px]" role="tablist"><button onClick={() => setTab("uniform")} className={`tab ${tab === "uniform" ? "tab-active" : ""}`}>Uniform &amp; Noise</button><button onClick={() => setTab("dose")} className={`tab ${tab === "dose" ? "tab-active" : ""}`}>Meter &amp; Dose</button><button onClick={() => setTab("light")} className={`tab ${tab === "light" ? "tab-active" : ""}`}>Light Probe</button></div>
       {tab === "uniform" ? <div className="grid gap-6 lg:grid-cols-[1fr_0.9fr]">
         <section className="card"><div className="card-header"><h2>นำเข้าข้อมูล ROI</h2><p>อัปโหลดไฟล์ผลการวัดจากเครื่องมือในรูปแบบ CSV</p></div><div className="card-body space-y-5">
           <div><label className="label" htmlFor="mode">โหมดการสแกน</label><select id="mode" value={mode} onChange={(e) => setMode(e.target.value)} className="input">{modes.map((item) => <option key={item.value}>{item.value}</option>)}</select></div>
@@ -329,7 +371,7 @@ export default function Home() {
         <section className="card"><div className="card-header"><h2>ผลการคำนวณ</h2><p>{result ? `อ้างอิงเกณฑ์โหมด ${mode}` : "ผลลัพธ์จะแสดงหลังจากอัปโหลดไฟล์"}</p></div><div className="card-body">
           {!result ? <div className="empty"><div className="upload-icon"><Icon name="file"/></div><p>ยังไม่มีข้อมูลสำหรับคำนวณ</p><span>เลือกไฟล์ CSV เพื่อเริ่มต้น</span></div> : <div className="space-y-5"><div className="result-grid"><Result label="Uniformity" value={`${fmt(result.uniformity, 2)}%`} pass={result.passUniform} criteria={result.limits.criteria}/><Result label="Noise" value={`${fmt(result.noise, 2)}%`} pass={result.passNoise} criteria="-10% ถึง 10%"/></div><div className="rounded-lg border"><div className="table-scroll"><table><thead><tr><th>ตำแหน่ง</th><th>Mean (HU)</th><th>SD (HU)</th></tr></thead><tbody>{rois.map((roi, i) => <tr key={positions[i]}><td>{positions[i]}</td><td>{fmt(roi.mean)}</td><td>{fmt(roi.stdDev)}</td></tr>)}</tbody></table></div></div><div className="formula"><p>Mean เฉลี่ย 4 ขอบ <strong>{fmt(result.edgeMean)} HU</strong></p><p>Mean จุดกลาง <strong>{fmt(rois[4].mean)} HU</strong></p></div></div>}
         </div></section>
-      </div> : <div className="space-y-6">
+      </div> : tab === "dose" ? <div className="space-y-6">
         <section className="meter-grid">
           <div className="card"><div className="card-header"><h2>สร้าง Session เชื่อมต่อมิเตอร์</h2><p>RTI Piranha และ ACCU-GOLD2 ผ่าน Serial หรือ Bluetooth</p></div><div className="card-body space-y-4">
             <div className="session-fields"><div><label className="label" htmlFor="session-name">ชื่อ Session</label><input id="session-name" className="input" value={sessionName} onChange={(e) => setSessionName(e.target.value)} placeholder="QA Session"/></div><div><label className="label" htmlFor="meter">มิเตอร์</label><select id="meter" className="input" value={meter} onChange={(e) => setMeter(e.target.value as Meter)}><option>RTI Piranha</option><option>ACCU-GOLD2</option></select></div></div>
@@ -354,6 +396,11 @@ export default function Home() {
           <div className="table-actions"><span>{validRows.length}/5 ค่าที่สมบูรณ์</span><button className="text-button" onClick={() => { setDoseRows(Array.from({ length: 5 }, blankDoseRow)); setMeterMessage("ล้างข้อมูลแล้ว"); }}><Icon name="trash" size={15}/>ล้างตาราง</button></div>
           {!doseResult ? <div className="info"><Icon name="shield" size={18}/><p><strong>ต้องมีข้อมูลครบ 5 ครั้ง</strong><br/><span>ระบบจะคำนวณ Mean, sample SD และ %CV เมื่อค่าทุกช่องมากกว่า 0</span></p></div> : <><div className="result-grid three"><DoseResult label="kV × factor" data={doseResult.kv}/><DoseResult label="Scan time" data={doseResult.scan}/><DoseResult label="Dose" data={doseResult.dose}/></div><div className={`alert ${doseResult.hvlPass ? "alert-success" : "alert-error"}`}>{doseResult.hvlPass ? <Icon name="check" size={17}/> : <Icon name="x" size={17}/>}HVL เฉลี่ย {fmt(doseResult.hvlMean, 2)} mm Al — {doseResult.hvlPass ? "ผ่านเกณฑ์ทุกครั้ง (> 2.5 mm Al)" : "ไม่ผ่านเกณฑ์"}</div></>}
         </div></section>
+      </div> : <div className="space-y-6">
+        <section className="light-toolbar card"><div className="card-header row-header"><div><h2>RTI Piranha Light Probe</h2><p>วัด Luminance และ Illuminance แบบเรียลไทม์</p></div><span className={`status ${meterStatus === "connected" ? "status-pass" : "status-fail"}`}>{meterStatus === "connected" ? "เชื่อมต่อแล้ว" : "ยังไม่เชื่อมต่อ"}</span></div><div className="card-body light-controls"><div><label className="label" htmlFor="light-mode">โหมดการวัด</label><select id="light-mode" className="input" value={lightMode} onChange={(e) => setLightMode(e.target.value as LightMode)}>{lightModes.map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}</select><p className="field-note">{lightModes.find((item) => item.value === lightMode)?.description}</p></div><div className="light-actions"><button className={`button ${lightRecording ? "button-danger" : "button-primary"}`} onClick={() => setLightRecording((value) => !value)}>{lightRecording ? "หยุดบันทึก" : "เริ่มบันทึก"}</button><button className="button" onClick={() => setLightSamples([])}><Icon name="trash" size={15}/>ล้างข้อมูล</button></div>{meterStatus !== "connected" && <div className="info"><Icon name="plug" size={18}/><p><strong>เชื่อมต่อ Piranha ก่อนเริ่มวัด</strong><br/><span>ไปที่แท็บ Meter &amp; Dose เพื่อเปิด Session เดียวกัน ข้อมูล Light Probe จะถูกส่งมายังหน้านี้อัตโนมัติ</span></p></div>}</div></section>
+        <section className="light-kpis">{lightStats ? <><CurrentValue label="Realtime" value={fmt(lightStats.current, 2)} unit={lightModes.find((item) => item.value === lightMode)!.unit}/><CurrentValue label="Maximum" value={fmt(lightStats.max, 2)} unit={lightModes.find((item) => item.value === lightMode)!.unit}/><CurrentValue label="Minimum" value={fmt(lightStats.min, 2)} unit={lightModes.find((item) => item.value === lightMode)!.unit}/><CurrentValue label="Average" value={fmt(lightStats.mean, 2)} unit={lightModes.find((item) => item.value === lightMode)!.unit}/></> : <div className="light-empty-kpi">รอค่าจาก Light Probe เช่น <code>luminance=245.6</code> หรือ <code>lux=18.2</code></div>}</section>
+        <section className="card"><div className="card-header row-header"><div><h2>Light waveform</h2><p>{lightSamples.length} samples • แสดง 300 ค่าล่าสุด</p></div><span className={`live-indicator ${lightRecording ? "active" : ""}`}><span/> {lightRecording ? "LIVE" : "PAUSED"}</span></div><div className="card-body"><LightChart samples={lightSamples} unit={lightModes.find((item) => item.value === lightMode)!.unit}/></div></section>
+        <section className="card"><div className="card-header"><h2>ค่าล่าสุด</h2><p>ประวัติ 20 samples ล่าสุด</p></div><div className="card-body"><div className="table-scroll"><table><thead><tr><th>เวลา</th><th>โหมด</th><th>ค่าแสง</th><th>หน่วย</th></tr></thead><tbody>{lightSamples.slice(-20).reverse().map((sample, index) => <tr key={`${sample.at}-${index}`}><td>{new Date(sample.at).toLocaleTimeString("th-TH")}</td><td>{lightModes.find((item) => item.value === lightMode)!.label}</td><td>{fmt(sample.value, 3)}</td><td>{lightModes.find((item) => item.value === lightMode)!.unit}</td></tr>)}</tbody></table></div></div></section>
       </div>}
     </main><footer className="mx-auto flex max-w-7xl items-center gap-2 px-4 pb-8 text-xs text-muted-foreground sm:px-6"><Icon name="shield" size={14}/> ค่าทั้งหมดประมวลผลในอุปกรณ์นี้ โปรดตรวจสอบหน่วยและผลก่อนใช้ทางคลินิก</footer>
   </div>;
@@ -370,4 +417,11 @@ function WaveChart({ rows, field }: { rows: DoseRow[]; field: DoseField }) {
   const min = Math.min(...values), max = Math.max(...values), spread = max - min || Math.max(max * 0.1, 1);
   const points = values.map((value, i) => `${24 + (i * 552) / Math.max(values.length - 1, 1)},${156 - ((value - min) / spread) * 112}`).join(" ");
   return <div className="wave-wrap"><div className="wave-scale"><span>{fmt(max, 2)} {labels[field]}</span><span>{fmt(min, 2)} {labels[field]}</span></div><svg className="wave-chart" viewBox="0 0 600 180" role="img" aria-label={`กราฟ ${field}`}><defs><linearGradient id="area" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stopColor="#2563eb" stopOpacity=".22"/><stop offset="1" stopColor="#2563eb" stopOpacity="0"/></linearGradient></defs><path d="M24 44H576M24 100H576M24 156H576" className="grid-line"/><polygon points={`24,156 ${points} 576,156`} fill="url(#area)"/><polyline points={points} className="wave-line"/>{values.map((value, i) => { const x = 24 + (i * 552) / Math.max(values.length - 1, 1); const y = 156 - ((value - min) / spread) * 112; return <g key={i}><circle cx={x} cy={y} r="5" className="wave-dot"/><text x={x} y="174" textAnchor="middle">{i + 1}</text></g>; })}</svg></div>;
+}
+function LightChart({ samples, unit }: { samples: LightSample[]; unit: string }) {
+  if (!samples.length) return <div className="chart-empty"><Icon name="wave" size={25}/><span>กราฟจะแสดงเมื่อได้รับค่าจาก Light Probe</span></div>;
+  const visible = samples.slice(-100), values = visible.map((sample) => sample.value);
+  const min = Math.min(...values), max = Math.max(...values), spread = max - min || Math.max(max * 0.1, 1);
+  const points = values.map((value, index) => `${24 + (index * 552) / Math.max(values.length - 1, 1)},${156 - ((value - min) / spread) * 112}`).join(" ");
+  return <div className="wave-wrap"><div className="wave-scale"><span>{fmt(max, 2)} {unit}</span><span>{fmt(min, 2)} {unit}</span></div><svg className="wave-chart light-wave" viewBox="0 0 600 180" role="img" aria-label="กราฟค่าแสงแบบเรียลไทม์"><defs><linearGradient id="light-area" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stopColor="#f59e0b" stopOpacity=".3"/><stop offset="1" stopColor="#f59e0b" stopOpacity="0"/></linearGradient></defs><path d="M24 44H576M24 100H576M24 156H576" className="grid-line"/><polygon points={`24,156 ${points} 576,156`} fill="url(#light-area)"/><polyline points={points} className="light-wave-line"/></svg></div>;
 }
