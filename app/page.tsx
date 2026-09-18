@@ -6,8 +6,10 @@ type Roi = { area: number; mean: number; stdDev: number; min: number; max: numbe
 type DoseField = "kv" | "scanTime" | "dose" | "hvl";
 type DoseRow = Record<DoseField, string> & { source?: string; capturedAt?: string };
 type Meter = "RTI Piranha" | "ACCU-GOLD2";
+type MeasurementMode = "CT" | "Dental" | "Radiography / Fluoroscopy";
 type LightMode = "luminance" | "illuminance" | "ambient";
 type LightSample = { value: number; at: number };
+type RawPacket = { at: number; source: string; text: string; hex: string; bytes: number };
 type SerialPortLike = {
   open: (options: { baudRate: number }) => Promise<void>;
   close: () => Promise<void>;
@@ -128,7 +130,9 @@ const lightModes: Array<{ value: LightMode; label: string; unit: string; descrip
   { value: "ambient", label: "Ambient light", unit: "lx", description: "แสงแวดล้อมด้วย lux adapter" },
 ];
 function parseLightValue(line: string) {
-  const match = line.match(/(?:luminance|illuminance|ambient|light|lux|cd\/m2|cd\/m²|value)\s*[:=,]\s*([+-]?\d+(?:[.,]\d+)?)/i);
+  const labelled = line.match(/(?:luminance|illuminance|ambient|light|lux|cd\/m2|cd\/m²|value)\s*[:=,]\s*([+-]?\d+(?:[.,]\d+)?)/i);
+  const unitAfter = line.match(/([+-]?\d+(?:[.,]\d+)?)\s*(?:lx|lux|cd\s*\/\s*m(?:2|²))/i);
+  const match = labelled ?? unitAfter;
   if (!match) return null;
   const value = toNumber(match[1]);
   return Number.isFinite(value) && value >= 0 ? value : null;
@@ -150,6 +154,7 @@ export default function Home() {
   const bluetoothCharacteristicRef = useRef<BluetoothCharacteristicLike | null>(null);
   const stopSerialRef = useRef(false);
   const [meter, setMeter] = useState<Meter>("RTI Piranha");
+  const [measurementMode, setMeasurementMode] = useState<MeasurementMode>("CT");
   const [transport, setTransport] = useState<"serial" | "bluetooth">("bluetooth");
   const [sessionName, setSessionName] = useState("QA Session 1");
   const [baudRate, setBaudRate] = useState("115200");
@@ -158,9 +163,12 @@ export default function Home() {
   const [knownPortCount, setKnownPortCount] = useState<number | null>(null);
   const [bluetoothDeviceName, setBluetoothDeviceName] = useState("");
   const [knownBluetoothNames, setKnownBluetoothNames] = useState<string[]>([]);
+  const [doseCaptureEnabled, setDoseCaptureEnabled] = useState(false);
   const [lightMode, setLightMode] = useState<LightMode>("luminance");
   const [lightSamples, setLightSamples] = useState<LightSample[]>([]);
   const [lightRecording, setLightRecording] = useState(true);
+  const [rawPackets, setRawPackets] = useState<RawPacket[]>([]);
+  const [receivedBytes, setReceivedBytes] = useState(0);
   const [meterStatus, setMeterStatus] = useState<"idle" | "reading" | "connected" | "error">("idle");
   const [meterMessage, setMeterMessage] = useState("เลือกมิเตอร์ แล้วนำเข้าผลหรือเชื่อมต่อ Web Serial");
   const [factor, setFactor] = useState("0.95");
@@ -192,7 +200,19 @@ export default function Home() {
   function ingestStreamLine(line: string, source: string) {
     const light = parseLightValue(line);
     if (light !== null && lightRecording) setLightSamples((samples) => [...samples, { value: light, at: Date.now() }].slice(-300));
-    try { const rows = parseMeterText(line, meter); if (rows.length) addMeasurements(rows, source); } catch { /* line may contain light data only */ }
+    if (doseCaptureEnabled) {
+      try { const rows = parseMeterText(line, meter); if (rows.length) addMeasurements(rows, source); } catch { /* line may contain light data only */ }
+    }
+  }
+  function startDoseCapture() {
+    setDoseRows(Array.from({ length: 5 }, blankDoseRow));
+    setRawPackets([]); setReceivedBytes(0); setDoseCaptureEnabled(true);
+    setMeterMessage(`เปิดรับค่าโหมด ${measurementMode} แล้ว — รอข้อมูลจากมิเตอร์`);
+  }
+  function recordRaw(bytes: Uint8Array, textValue: string, source: string) {
+    const hex = Array.from(bytes.slice(0, 48), (byte) => byte.toString(16).padStart(2, "0")).join(" ");
+    setReceivedBytes((total) => total + bytes.byteLength);
+    setRawPackets((packets) => [...packets, { at: Date.now(), source, text: textValue.replace(/[\r\n]+/g, " ↵ ").slice(0, 180), hex, bytes: bytes.byteLength }].slice(-30));
   }
 
   async function handleFile(file?: File) {
@@ -233,11 +253,13 @@ export default function Home() {
       serialReaderRef.current = reader;
       const decoder = new TextDecoder(); let buffer = "";
       while (!stopSerialRef.current) {
-        const { value, done } = await reader.read(); if (done) break; buffer += decoder.decode(value, { stream: true });
+        const { value, done } = await reader.read(); if (done) break;
+        const decoded = decoder.decode(value, { stream: true }); recordRaw(value, decoded, `${meter} Serial`); buffer += decoded;
         const lines = buffer.split(/\r?\n/); buffer = lines.pop() ?? "";
         for (const line of lines) {
-          ingestStreamLine(line, meter);
+          ingestStreamLine(line, `${meter} • ${measurementMode}`);
         }
+        if (!lines.length && parseLightValue(buffer) !== null) { ingestStreamLine(buffer, meter); buffer = ""; }
       }
       reader.releaseLock(); serialReaderRef.current = null;
     } catch (e) {
@@ -300,11 +322,13 @@ export default function Home() {
       characteristic.addEventListener("characteristicvaluechanged", (event) => {
         const value = (event.target as BluetoothCharacteristicLike).value;
         if (!value) return;
-        buffer += decoder.decode(new Uint8Array(value.buffer, value.byteOffset, value.byteLength), { stream: true });
+        const bytes = new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+        const decoded = decoder.decode(bytes, { stream: true }); recordRaw(bytes, decoded, `${meter} Bluetooth`); buffer += decoded;
         const lines = buffer.split(/\r?\n/); buffer = lines.pop() ?? "";
         for (const line of lines) {
-          ingestStreamLine(line, `${meter} Bluetooth`);
+          ingestStreamLine(line, `${meter} Bluetooth • ${measurementMode}`);
         }
+        if (!lines.length && parseLightValue(buffer) !== null) { ingestStreamLine(buffer, `${meter} Bluetooth`); buffer = ""; }
       });
       await characteristic.startNotifications();
       setMeterStatus("connected"); setMeterMessage(`${sessionName}: เชื่อมต่อ ${visibleName} ผ่าน Web Bluetooth แล้ว`);
@@ -375,6 +399,7 @@ export default function Home() {
         <section className="meter-grid">
           <div className="card"><div className="card-header"><h2>สร้าง Session เชื่อมต่อมิเตอร์</h2><p>RTI Piranha และ ACCU-GOLD2 ผ่าน Serial หรือ Bluetooth</p></div><div className="card-body space-y-4">
             <div className="session-fields"><div><label className="label" htmlFor="session-name">ชื่อ Session</label><input id="session-name" className="input" value={sessionName} onChange={(e) => setSessionName(e.target.value)} placeholder="QA Session"/></div><div><label className="label" htmlFor="meter">มิเตอร์</label><select id="meter" className="input" value={meter} onChange={(e) => setMeter(e.target.value as Meter)}><option>RTI Piranha</option><option>ACCU-GOLD2</option></select></div></div>
+            <div><label className="label" htmlFor="measurement-mode">Measurement mode</label><select id="measurement-mode" className="input" value={measurementMode} onChange={(e) => setMeasurementMode(e.target.value as MeasurementMode)}><option>CT</option><option>Dental</option><option>Radiography / Fluoroscopy</option></select><p className="field-note">เลือกให้ตรงกับโหมดที่ตั้งใน Piranha/Ocean ก่อนเริ่ม Session</p></div>
             <div><span className="label">การเชื่อมต่อ</span><div className="transport-tabs"><button className={transport === "bluetooth" ? "active" : ""} onClick={() => setTransport("bluetooth")}>1. Bluetooth (BLE)</button><button className={transport === "serial" ? "active" : ""} onClick={() => setTransport("serial")}>2. Serial / Bluetooth COM</button></div></div>
             {transport === "serial" ? <div><label className="label" htmlFor="baud-rate">Baud rate</label><select id="baud-rate" className="input" value={baudRate} onChange={(e) => setBaudRate(e.target.value)}><option>9600</option><option>19200</option><option>38400</option><option>57600</option><option>115200</option></select><p className="field-note">สำหรับ USB หรือ Bluetooth Classic/SPP ที่ Windows แสดงเป็น COM port</p></div> : <div className="ble-fields">{bluetoothDeviceName && <div className="selected-device"><span>อุปกรณ์ที่เลือก</span><strong>{bluetoothDeviceName}</strong></div>}<div><label className="label" htmlFor="service-uuid">Service UUID</label><input id="service-uuid" className="input mono" value={serviceUuid} onChange={(e) => setServiceUuid(e.target.value)} placeholder="UUID จาก SDK ผู้ผลิต"/></div><div><label className="label" htmlFor="characteristic-uuid">Notify Characteristic UUID</label><input id="characteristic-uuid" className="input mono" value={characteristicUuid} onChange={(e) => setCharacteristicUuid(e.target.value)} placeholder="UUID จาก SDK ผู้ผลิต"/></div><p className="field-note">บน Android แอปจะไม่รอค้นหาแบบไม่จำกัดเวลา: ต้องมี BLE UUID ที่ถูกต้อง หรือใช้ USB-OTG/Serial</p></div>}
             {transport === "serial" ? <div className="serial-actions"><button className="button button-primary" onClick={querySerialPorts} disabled={meterStatus === "reading" || meterStatus === "connected"}><Icon name="plug"/>สแกนพอร์ตที่อนุญาต</button><button className="button" onClick={startSession} disabled={meterStatus === "reading" || meterStatus === "connected"}>อนุญาตพอร์ตใหม่</button><span>{knownPortCount === null ? "ยังไม่ได้สแกน" : `พบ ${knownPortCount} พอร์ต`}</span></div> : <div className="bluetooth-actions"><div className="bluetooth-search-grid"><button className="button button-primary" onClick={queryKnownBluetoothDevices} disabled={meterStatus === "reading" || meterStatus === "connected"}><Icon name="plug"/>เชื่อมต่อ {meter}</button><button className="button" onClick={() => connectBluetooth(undefined, true)} disabled={meterStatus === "reading" || meterStatus === "connected"}>เลือกแบบกรองชื่อ</button><button className="button subtle-button" onClick={startSession} disabled={meterStatus === "reading" || meterStatus === "connected"}>ไม่พบชื่อ? แสดงอุปกรณ์ BLE ทั้งหมด</button></div>{knownBluetoothNames.length > 0 && <div className="known-devices">{knownBluetoothNames.map((name, index) => <button key={`${name}-${index}`} onClick={() => connectBluetooth(knownBluetoothDevicesRef.current[index])} disabled={meterStatus === "reading" || meterStatus === "connected"}><span className="connection-dot"/><span><strong>{name}</strong><small>เคยอนุญาตให้เว็บนี้</small></span></button>)}</div>}</div>}
@@ -384,8 +409,9 @@ export default function Home() {
             {transport === "serial" && <div className="mobile-note"><strong>Samsung Galaxy Z Fold 5 / Android</strong><span>USB Serial ต้องใช้ Chrome รุ่นที่รองรับ, หน้าเว็บ HTTPS และสาย USB-OTG แบบรับส่งข้อมูล หากไม่พบพอร์ต ให้เปิดมิเตอร์และเสียบสายก่อนกดเริ่ม Session; อุปกรณ์ BLE ให้เลือก Web Bluetooth</span></div>}
             <p className="helper">รองรับข้อความรูปแบบหัวตาราง CSV/TSV หรือบรรทัด เช่น <code>kV=89.6, time=18.29, dose=3.065, HVL=5.61</code></p>
           </div></div>
-          <div className="card current-panel"><div className="card-header"><h2>ค่าปัจจุบัน</h2><p>{current ? `${current.source ?? meter} • ${current.capturedAt ? new Date(current.capturedAt).toLocaleTimeString("th-TH") : "แก้ไขด้วยตนเอง"}` : "รอข้อมูลจากมิเตอร์"}</p></div><div className="card-body">
+          <div className="card current-panel"><div className="card-header row-header"><div><h2>ค่าปัจจุบัน</h2><p>{current ? `${current.source ?? meter} • ${current.capturedAt ? new Date(current.capturedAt).toLocaleTimeString("th-TH") : "แก้ไขด้วยตนเอง"}` : "รอข้อมูลจากมิเตอร์"}</p></div><span className={`live-indicator ${doseCaptureEnabled ? "active" : ""}`}><span/> {doseCaptureEnabled ? `RECEIVING ${measurementMode}` : "STOPPED"}</span></div><div className="card-body">
             {current ? <div className="current-grid"><CurrentValue label="kV" value={fmt(Number(current.kv), 2)} unit="kV"/><CurrentValue label="kV × factor" value={fmt(Number(current.kv) * Number(factor), 2)} unit="kV"/><CurrentValue label="Scan time" value={fmt(Number(current.scanTime), 3)} unit="s"/><CurrentValue label="Dose" value={fmt(Number(current.dose), 3)} unit="mGy"/><CurrentValue label="HVL" value={fmt(Number(current.hvl), 2)} unit="mm Al"/></div> : <div className="empty compact"><div className="upload-icon"><Icon name="wave"/></div><p>ยังไม่มีค่าการวัด</p><span>เชื่อมต่อมิเตอร์ นำเข้าไฟล์ หรือกรอกในตาราง</span></div>}
+            <div className="capture-actions"><button className={`button ${doseCaptureEnabled ? "button-danger" : "button-primary"}`} onClick={() => doseCaptureEnabled ? setDoseCaptureEnabled(false) : startDoseCapture()}><Icon name={doseCaptureEnabled ? "x" : "wave"}/>{doseCaptureEnabled ? "หยุดรับค่า" : `เปิดรับค่า ${measurementMode}`}</button><small>รับเฉพาะ record ที่มี kV, Scan time, Dose และ HVL ครบ</small></div>
           </div></div>
         </section>
 
@@ -396,11 +422,13 @@ export default function Home() {
           <div className="table-actions"><span>{validRows.length}/5 ค่าที่สมบูรณ์</span><button className="text-button" onClick={() => { setDoseRows(Array.from({ length: 5 }, blankDoseRow)); setMeterMessage("ล้างข้อมูลแล้ว"); }}><Icon name="trash" size={15}/>ล้างตาราง</button></div>
           {!doseResult ? <div className="info"><Icon name="shield" size={18}/><p><strong>ต้องมีข้อมูลครบ 5 ครั้ง</strong><br/><span>ระบบจะคำนวณ Mean, sample SD และ %CV เมื่อค่าทุกช่องมากกว่า 0</span></p></div> : <><div className="result-grid three"><DoseResult label="kV × factor" data={doseResult.kv}/><DoseResult label="Scan time" data={doseResult.scan}/><DoseResult label="Dose" data={doseResult.dose}/></div><div className={`alert ${doseResult.hvlPass ? "alert-success" : "alert-error"}`}>{doseResult.hvlPass ? <Icon name="check" size={17}/> : <Icon name="x" size={17}/>}HVL เฉลี่ย {fmt(doseResult.hvlMean, 2)} mm Al — {doseResult.hvlPass ? "ผ่านเกณฑ์ทุกครั้ง (> 2.5 mm Al)" : "ไม่ผ่านเกณฑ์"}</div></>}
         </div></section>
+        <section className="card"><div className="card-header row-header"><div><h2>Meter RX diagnostics</h2><p>{measurementMode} • ตรวจสอบข้อมูลที่ส่งจากมิเตอร์หลังยิง</p></div><div className="rx-summary"><strong>{receivedBytes.toLocaleString()}</strong><span>bytes received</span></div></div><div className="card-body">{rawPackets.length ? <div className="raw-log">{rawPackets.slice().reverse().map((packet, index) => <div key={`${packet.at}-${index}`}><div><span>{new Date(packet.at).toLocaleTimeString("th-TH")}</span><strong>{packet.source}</strong><small>{packet.bytes} bytes</small></div><code>{packet.text || `(binary) ${packet.hex}`}</code>{packet.text && <code className="hex">HEX {packet.hex}</code>}</div>)}</div> : <div className="diagnostic-empty"><strong>หลังยิงแล้วยังไม่ได้รับข้อมูล</strong><span>ถ้า bytes received ยังเป็น 0 แสดงว่า Piranha ยังไม่ได้ stream มายัง session นี้ ให้เลือกโหมดเดียวกันใน Ocean/Piranha หรือใช้โปรโตคอล/SDK ของ RTI เพื่อส่งคำสั่ง Start Measurement</span></div>}</div></section>
       </div> : <div className="space-y-6">
         <section className="light-toolbar card"><div className="card-header row-header"><div><h2>RTI Piranha Light Probe</h2><p>วัด Luminance และ Illuminance แบบเรียลไทม์</p></div><span className={`status ${meterStatus === "connected" ? "status-pass" : "status-fail"}`}>{meterStatus === "connected" ? "เชื่อมต่อแล้ว" : "ยังไม่เชื่อมต่อ"}</span></div><div className="card-body light-controls"><div><label className="label" htmlFor="light-mode">โหมดการวัด</label><select id="light-mode" className="input" value={lightMode} onChange={(e) => setLightMode(e.target.value as LightMode)}>{lightModes.map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}</select><p className="field-note">{lightModes.find((item) => item.value === lightMode)?.description}</p></div><div className="light-actions"><button className={`button ${lightRecording ? "button-danger" : "button-primary"}`} onClick={() => setLightRecording((value) => !value)}>{lightRecording ? "หยุดบันทึก" : "เริ่มบันทึก"}</button><button className="button" onClick={() => setLightSamples([])}><Icon name="trash" size={15}/>ล้างข้อมูล</button></div>{meterStatus !== "connected" && <div className="info"><Icon name="plug" size={18}/><p><strong>เชื่อมต่อ Piranha ก่อนเริ่มวัด</strong><br/><span>ไปที่แท็บ Meter &amp; Dose เพื่อเปิด Session เดียวกัน ข้อมูล Light Probe จะถูกส่งมายังหน้านี้อัตโนมัติ</span></p></div>}</div></section>
         <section className="light-kpis">{lightStats ? <><CurrentValue label="Realtime" value={fmt(lightStats.current, 2)} unit={lightModes.find((item) => item.value === lightMode)!.unit}/><CurrentValue label="Maximum" value={fmt(lightStats.max, 2)} unit={lightModes.find((item) => item.value === lightMode)!.unit}/><CurrentValue label="Minimum" value={fmt(lightStats.min, 2)} unit={lightModes.find((item) => item.value === lightMode)!.unit}/><CurrentValue label="Average" value={fmt(lightStats.mean, 2)} unit={lightModes.find((item) => item.value === lightMode)!.unit}/></> : <div className="light-empty-kpi">รอค่าจาก Light Probe เช่น <code>luminance=245.6</code> หรือ <code>lux=18.2</code></div>}</section>
         <section className="card"><div className="card-header row-header"><div><h2>Light waveform</h2><p>{lightSamples.length} samples • แสดง 300 ค่าล่าสุด</p></div><span className={`live-indicator ${lightRecording ? "active" : ""}`}><span/> {lightRecording ? "LIVE" : "PAUSED"}</span></div><div className="card-body"><LightChart samples={lightSamples} unit={lightModes.find((item) => item.value === lightMode)!.unit}/></div></section>
         <section className="card"><div className="card-header"><h2>ค่าล่าสุด</h2><p>ประวัติ 20 samples ล่าสุด</p></div><div className="card-body"><div className="table-scroll"><table><thead><tr><th>เวลา</th><th>โหมด</th><th>ค่าแสง</th><th>หน่วย</th></tr></thead><tbody>{lightSamples.slice(-20).reverse().map((sample, index) => <tr key={`${sample.at}-${index}`}><td>{new Date(sample.at).toLocaleTimeString("th-TH")}</td><td>{lightModes.find((item) => item.value === lightMode)!.label}</td><td>{fmt(sample.value, 3)}</td><td>{lightModes.find((item) => item.value === lightMode)!.unit}</td></tr>)}</tbody></table></div></div></section>
+        <section className="card"><div className="card-header row-header"><div><h2>Raw RX diagnostics</h2><p>ตรวจสอบว่ามิเตอร์ส่งข้อมูลเข้ามาจริงหรือไม่</p></div><div className="rx-summary"><strong>{receivedBytes.toLocaleString()}</strong><span>bytes received</span></div></div><div className="card-body">{rawPackets.length ? <div className="raw-log">{rawPackets.slice().reverse().map((packet, index) => <div key={`${packet.at}-${index}`}><div><span>{new Date(packet.at).toLocaleTimeString("th-TH")}</span><strong>{packet.source}</strong><small>{packet.bytes} bytes</small></div><code>{packet.text || `(binary) ${packet.hex}`}</code>{packet.text && <code className="hex">HEX {packet.hex}</code>}</div>)}</div> : <div className="diagnostic-empty"><strong>ยังไม่ได้รับข้อมูลแม้แต่ 1 byte</strong><span>ถ้ายิงหรือเปิดแสงแล้วค่ายังเป็น 0 แสดงว่ามิเตอร์ไม่ได้ stream ข้อมูลมายัง connection นี้ หรือจำเป็นต้องส่งคำสั่ง Start Measurement ตามโปรโตคอล RTI ก่อน</span></div>}</div></section>
       </div>}
     </main><footer className="mx-auto flex max-w-7xl items-center gap-2 px-4 pb-8 text-xs text-muted-foreground sm:px-6"><Icon name="shield" size={14}/> ค่าทั้งหมดประมวลผลในอุปกรณ์นี้ โปรดตรวจสอบหน่วยและผลก่อนใช้ทางคลินิก</footer>
   </div>;
