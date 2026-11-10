@@ -45,10 +45,7 @@ declare global {
 
 const positions = ["ขอบบน", "ขอบขวา", "ขอบล่าง", "ขอบซ้าย", "จุดกลาง"];
 const modes = [
-  { value: "0.4 mm", criteria: "-10% ถึง 10%", min: -10, max: 10 },
-  { value: "0.25 mm", criteria: "10% ถึง 30%", min: 10, max: 30 },
-  { value: "0.2 mm (FOV 12×6 cm)", criteria: "0% ถึง 20%", min: 0, max: 20 },
-  { value: "0.2 mm (FOV 8×8 cm)", criteria: "-10% ถึง 10%", min: -10, max: 10 },
+  { value: "Uniformity", criteria: "-10% ถึง 30%", min: -10, max: 30 },
 ];
 const blankDoseRow = (): DoseRow => ({ kv: "", scanTime: "", dose: "", hvl: "" });
 const aliases: Record<DoseField, string[]> = {
@@ -79,11 +76,11 @@ const findColumn = (headers: string[], field: DoseField) => headers.findIndex((h
 
 function parseCsv(text: string): Roi[] {
   const lines = text.replace(/^\uFEFF/, "").trim().split(/\r?\n/).filter(Boolean);
-  if (lines.length < 6) throw new Error("ไฟล์ต้องมีหัวตารางและข้อมูล ROI อย่างน้อย 5 แถว");
+  if (lines.length < 4) throw new Error("ไฟล์ต้องมีหัวตารางและข้อมูลอย่างน้อย 3 แถว");
   const headers = splitLine(lines[0]).map(normalizeHeader);
   const col = (name: string) => headers.indexOf(normalizeHeader(name));
   for (const name of ["Area", "Mean", "StdDev", "Min", "Max", "Median"]) if (col(name) < 0) throw new Error(`ไม่พบคอลัมน์ ${name}`);
-  return lines.slice(1, 6).map((line, index) => {
+  return lines.slice(1).map((line, index) => {
     const values = splitLine(line);
     const number = (name: string) => { const value = toNumber(values[col(name)]); if (!Number.isFinite(value)) throw new Error(`ข้อมูล ${name} แถวที่ ${index + 1} ไม่ถูกต้อง`); return value; };
     return { area: number("Area"), mean: number("Mean"), stdDev: number("StdDev"), min: number("Min"), max: number("Max"), median: number("Median") };
@@ -151,9 +148,10 @@ function parseLightValue(line: string) {
 }
 
 export default function Home() {
-  const [tab, setTab] = useState<"uniform" | "dose" | "light">("dose");
-  const [mode, setMode] = useState(modes[1].value);
+  const [tab, setTab] = useState<"uniform" | "dose">("dose");
+  const mode = modes[0].value;
   const [rois, setRois] = useState<Roi[]>([]);
+  const [selectedNoiseRows, setSelectedNoiseRows] = useState<number[]>([]);
   const [fileName, setFileName] = useState("");
   const [error, setError] = useState("");
   const [dragging, setDragging] = useState(false);
@@ -190,6 +188,7 @@ export default function Home() {
   const [meterMessage, setMeterMessage] = useState("เลือกมิเตอร์ แล้วนำเข้าผลหรือเชื่อมต่อ Web Serial");
   const [factor, setFactor] = useState("0.95");
   const [doseRows, setDoseRows] = useState<DoseRow[]>(Array.from({ length: 5 }, blankDoseRow));
+  const [selectedDoseRows, setSelectedDoseRows] = useState<number[]>([0, 1, 2, 3, 4]);
   const [waveField, setWaveField] = useState<DoseField>("kv");
   const [exportMessage, setExportMessage] = useState("");
   const [fixedScanTime, setFixedScanTime] = useState("");
@@ -219,24 +218,30 @@ export default function Home() {
   useEffect(() => { if (restoredSessionRef.current) sessionStorage.setItem("rti-raw-packets", JSON.stringify(rawPackets)); }, [rawPackets]);
   useEffect(() => () => { if (exposureTimerRef.current) clearTimeout(exposureTimerRef.current); }, []);
   const result = useMemo(() => {
-    if (rois.length !== 5) return null;
-    const edgeMean = avg(rois.slice(0, 4).map((r) => r.mean));
-    const uniformity = ((rois[4].mean - edgeMean) * 100) / (edgeMean + 1000);
-    const noise = (avg(rois.map((r) => r.stdDev)) * 100) / (rois[4].mean + 1000);
+    const selected = rois.filter((_, index) => selectedNoiseRows.includes(index));
+    if (!rois.length) return null;
+    const edgeMean = rois.length >= 5 ? avg(rois.slice(0, 4).map((r) => r.mean)) : Number.NaN;
+    const uniformity = rois.length >= 5 ? ((rois[4].mean - edgeMean) * 100) / (edgeMean + 1000) : Number.NaN;
+    const noise = selected.length === 3 || selected.length === 5 ? (avg(selected.map((r) => r.stdDev)) * 100) / (selected.at(-1)!.mean + 1000) : Number.NaN;
     const limits = modes.find((item) => item.value === mode)!;
     return { edgeMean, uniformity, noise, passUniform: uniformity >= limits.min && uniformity <= limits.max, passNoise: noise >= -10 && noise <= 10, limits };
-  }, [rois, mode]);
+  }, [rois, mode, selectedNoiseRows]);
   const validRows = useMemo(() => doseRows.filter((row) => (["kv", "scanTime", "dose", "hvl"] as DoseField[]).every((field) => Number(row[field]) > 0)), [doseRows]);
   const current = pendingExposure ?? validRows.at(-1) ?? null;
+  const calculationRows = useMemo(() => {
+    if (validRows.length === 3 || validRows.length === 5) return validRows;
+    if (validRows.length !== 0) return validRows.filter((row) => selectedDoseRows.includes(doseRows.indexOf(row)));
+    return [];
+  }, [validRows, doseRows, selectedDoseRows]);
   const doseResult = useMemo(() => {
-    if (validRows.length !== 5) return null;
+    if (calculationRows.length !== 3 && calculationRows.length !== 5) return null;
     const calibration = Number(factor);
     if (!Number.isFinite(calibration) || calibration <= 0) return null;
-    const values = (field: DoseField) => validRows.map((row) => Number(row[field]));
+    const values = (field: DoseField) => calculationRows.map((row) => Number(row[field]));
     const calibratedKv = values("kv").map((value) => value * calibration);
     const metric = (items: number[], limit: number) => ({ mean: avg(items), sd: sampleSd(items), cv: 100 * sampleSd(items) / avg(items), limit });
     return { calibratedKv, kv: metric(calibratedKv, 2), scan: metric(values("scanTime"), 5), dose: metric(values("dose"), 5), hvlMean: avg(values("hvl")), hvlPass: values("hvl").every((value) => value > 2.5) };
-  }, [validRows, factor]);
+  }, [calculationRows, factor]);
   const lightStats = useMemo(() => {
     const values = lightSamples.map((sample) => sample.value);
     return values.length ? { current: values.at(-1)!, min: Math.min(...values), max: Math.max(...values), mean: avg(values) } : null;
@@ -403,7 +408,12 @@ export default function Home() {
     if (!file) return; setError("");
     if (!file.name.toLowerCase().endsWith(".csv")) { setError("รองรับเฉพาะไฟล์ .csv"); return; }
     if (file.size > 5 * 1024 * 1024) { setError("ไฟล์ต้องมีขนาดไม่เกิน 5 MB"); return; }
-    try { setRois(parseCsv(await file.text())); setFileName(file.name); } catch (e) { setRois([]); setFileName(""); setError(e instanceof Error ? e.message : "อ่านไฟล์ไม่สำเร็จ"); }
+    try {
+      const rows = parseCsv(await file.text());
+      setRois(rows);
+      setSelectedNoiseRows(rows.length === 3 ? [0, 1, 2] : rows.length === 5 ? [0, 1, 2, 3, 4] : []);
+      setFileName(file.name);
+    } catch (e) { setRois([]); setSelectedNoiseRows([]); setFileName(""); setError(e instanceof Error ? e.message : "อ่านไฟล์ไม่สำเร็จ"); }
   }
   function onDrop(event: DragEvent<HTMLDivElement>) { event.preventDefault(); setDragging(false); handleFile(event.dataTransfer.files[0]); }
   function updateDose(index: number, field: DoseField, value: string) { setDoseRows((rows) => rows.map((row, i) => i === index ? { ...row, [field]: value, source: row.source ?? "Manual" } : row)); }
@@ -420,7 +430,14 @@ export default function Home() {
   async function handleMeterFile(file?: File) {
     if (!file) return;
     if (file.size > 10 * 1024 * 1024) { setMeterStatus("error"); setMeterMessage("ไฟล์ต้องมีขนาดไม่เกิน 10 MB"); return; }
-    try { addMeasurements(parseMeterText(await file.text(), meter), file.name); }
+    try {
+      const rows = parseMeterText(await file.text(), meter);
+      if (!rows.length) throw new Error("ไม่พบข้อมูลการวัดที่สมบูรณ์");
+      setDoseRows(rows);
+      setSelectedDoseRows(rows.length === 3 || rows.length === 5 ? rows.map((_, index) => index) : []);
+      setMeterStatus("connected");
+      setMeterMessage(`${file.name}: อ่านข้อมูลสำเร็จ ${rows.length} แถว`);
+    }
     catch (e) { setMeterStatus("error"); setMeterMessage(e instanceof Error ? e.message : "อ่านไฟล์ไม่สำเร็จ"); }
     finally { if (meterFileRef.current) meterFileRef.current.value = ""; }
   }
@@ -560,19 +577,19 @@ export default function Home() {
   return <div className="min-h-screen bg-muted text-foreground">
     <header className="border-b bg-card"><div className="mx-auto flex max-w-7xl items-center gap-3 px-4 py-4 sm:px-6"><div className="grid size-10 place-items-center rounded-lg bg-primary text-primary-foreground"><Icon name="flask" size={21}/></div><div><h1 className="text-base font-semibold leading-tight">Radiography QA Calculator</h1><p className="text-sm text-muted-foreground">รับค่าจากมิเตอร์ แสดงกราฟ และคำนวณตามแบบฟอร์มอ้างอิง</p></div></div></header>
     <main className="mx-auto max-w-7xl px-4 py-6 sm:px-6 sm:py-8">
-      <Tabs value={tab} onValueChange={(value) => setTab(value as "uniform" | "dose" | "light")} className="mb-6 w-full sm:w-[560px]"><TabsList className="grid h-auto w-full grid-cols-3"><TabsTrigger value="uniform">Uniform &amp; Noise</TabsTrigger><TabsTrigger value="dose">Meter &amp; Dose</TabsTrigger><TabsTrigger value="light">Light Probe</TabsTrigger></TabsList></Tabs>
+      <Tabs value={tab} onValueChange={(value) => setTab(value as "uniform" | "dose")} className="mb-6 w-full sm:w-[560px]"><TabsList className="grid h-auto w-full grid-cols-2"><TabsTrigger value="uniform">Uniform &amp; Noise</TabsTrigger><TabsTrigger value="dose">Meter &amp; Dose (พักไว้)</TabsTrigger></TabsList></Tabs>
       {tab === "uniform" ? <div className="grid gap-6 lg:grid-cols-[1fr_0.9fr]">
         <section className="card"><div className="card-header"><h2>นำเข้าข้อมูล ROI</h2><p>อัปโหลดไฟล์ผลการวัดจากเครื่องมือในรูปแบบ CSV</p></div><div className="card-body space-y-5">
-          <div><label className="label" htmlFor="mode">โหมดการสแกน</label><Select value={mode} onValueChange={setMode}><SelectTrigger id="mode" className="w-full"><SelectValue placeholder="เลือกโหมดการสแกน"/></SelectTrigger><SelectContent>{modes.map((item) => <SelectItem key={item.value} value={item.value}>{item.value}</SelectItem>)}</SelectContent></Select></div>
+          <div className="info"><Icon name="shield" size={18}/><p><strong>เกณฑ์ผ่าน Uniformity: -10% ถึง 30%</strong><br/><span>Noise แสดงค่าจากแถวที่เลือก</span></p></div>
           <div onDragOver={(e) => { e.preventDefault(); setDragging(true); }} onDragLeave={() => setDragging(false)} onDrop={onDrop} onClick={() => inputRef.current?.click()} className={`dropzone ${dragging ? "dropzone-active" : ""}`}><Input ref={inputRef} type="file" accept=".csv,text/csv" className="hidden" onChange={(e: ChangeEvent<HTMLInputElement>) => handleFile(e.target.files?.[0])}/><div className="upload-icon"><Icon name="upload"/></div><p className="font-medium">ลากไฟล์ CSV มาวางที่นี่</p><p className="text-sm text-muted-foreground">หรือคลิกเพื่อเลือกไฟล์ • สูงสุด 5 MB</p></div>
           {error && <div className="alert alert-error"><Icon name="x" size={17}/><span>{error}</span></div>}
-          {fileName && <div className="file-row"><Icon name="file"/><div className="min-w-0 flex-1"><p className="truncate text-sm font-medium">{fileName}</p><p className="text-xs text-muted-foreground">อ่านข้อมูล 5 ตำแหน่งสำเร็จ</p></div><span className="status status-pass"><Icon name="check" size={14}/>พร้อมคำนวณ</span></div>}
+          {fileName && <div className="file-row"><Icon name="file"/><div className="min-w-0 flex-1"><p className="truncate text-sm font-medium">{fileName}</p><p className="text-xs text-muted-foreground">อ่านข้อมูล {rois.length} แถว</p></div><span className="status status-pass"><Icon name="check" size={14}/>พร้อมเลือกข้อมูล</span></div>}
         </div></section>
         <section className="card"><div className="card-header"><h2>ผลการคำนวณ</h2><p>{result ? `อ้างอิงเกณฑ์โหมด ${mode}` : "ผลลัพธ์จะแสดงหลังจากอัปโหลดไฟล์"}</p></div><div className="card-body">
-          {!result ? <div className="empty"><div className="upload-icon"><Icon name="file"/></div><p>ยังไม่มีข้อมูลสำหรับคำนวณ</p><span>เลือกไฟล์ CSV เพื่อเริ่มต้น</span></div> : <div className="space-y-5"><div className="result-grid"><Result label="Uniformity" value={`${fmt(result.uniformity, 2)}%`} pass={result.passUniform} criteria={result.limits.criteria}/><Result label="Noise" value={`${fmt(result.noise, 2)}%`} pass={result.passNoise} criteria="-10% ถึง 10%"/></div><div className="rounded-lg border"><div className="table-scroll"><table><thead><tr><th>ตำแหน่ง</th><th>Mean (HU)</th><th>SD (HU)</th></tr></thead><tbody>{rois.map((roi, i) => <tr key={positions[i]}><td>{positions[i]}</td><td>{fmt(roi.mean)}</td><td>{fmt(roi.stdDev)}</td></tr>)}</tbody></table></div></div><div className="formula"><p>Mean เฉลี่ย 4 ขอบ <strong>{fmt(result.edgeMean)} HU</strong></p><p>Mean จุดกลาง <strong>{fmt(rois[4].mean)} HU</strong></p></div></div>}
+          {!result ? <div className="empty"><div className="upload-icon"><Icon name="file"/></div><p>{rois.length ? "เลือกข้อมูล Noise 3 หรือ 5 แถว และใช้ไฟล์ Uniformity 5 แถว" : "ยังไม่มีข้อมูลสำหรับคำนวณ"}</p><span>{rois.length ? "เลือกแถวที่ต้องการคำนวณในตาราง" : "เลือกไฟล์ CSV เพื่อเริ่มต้น"}</span></div> : <div className="space-y-5"><div className="result-grid"><Result label="Uniformity" value={`${fmt(result.uniformity, 2)}%`} pass={result.passUniform} criteria="-10% ถึง 30%"/><Result label="Noise" value={`${fmt(result.noise, 2)}%`} pass={result.passNoise} criteria="-10% ถึง 10%"/></div><div className="rounded-lg border"><div className="table-scroll"><table><thead><tr><th>เลือก Noise</th><th>ตำแหน่ง</th><th>Mean (HU)</th><th>SD (HU)</th></tr></thead><tbody>{rois.map((roi, i) => <tr key={i}><td><input type="checkbox" aria-label={`เลือกแถว ${i + 1} สำหรับ Noise`} checked={selectedNoiseRows.includes(i)} onChange={(event) => setSelectedNoiseRows((current) => event.target.checked ? [...current, i] : current.filter((item) => item !== i))}/></td><td>{positions[i] ?? `แถว ${i + 1}`}</td><td>{fmt(roi.mean)}</td><td>{fmt(roi.stdDev)}</td></tr>)}</tbody></table></div></div><div className="formula"><p>Mean เฉลี่ย 4 ขอบ <strong>{fmt(result.edgeMean)} HU</strong></p><p>Noise ใช้คำนวณ <strong>{selectedNoiseRows.length} แถว</strong></p></div></div>}
         </div></section>
       </div> : tab === "dose" ? <div className="space-y-6">
-        <section className="meter-grid">
+        <section className="meter-grid" style={{ display: "none" }}>
           <div className="card"><div className="card-header"><h2>สร้าง Session เชื่อมต่อมิเตอร์</h2><p>RTI Piranha และ ACCU-GOLD2 ผ่าน Serial หรือ Bluetooth</p></div><div className="card-body space-y-4">
             <div className="session-fields"><div><label className="label" htmlFor="session-name">ชื่อ Session</label><Input id="session-name" value={sessionName} onChange={(e) => setSessionName(e.target.value)} placeholder="QA Session"/></div><div><label className="label" htmlFor="meter">มิเตอร์</label><Select value={meter} onValueChange={(value) => setMeter(value as Meter)}><SelectTrigger id="meter" className="w-full"><SelectValue placeholder="เลือกมิเตอร์"/></SelectTrigger><SelectContent><SelectItem value="RTI Piranha">RTI Piranha</SelectItem><SelectItem value="ACCU-GOLD2">ACCU-GOLD2</SelectItem></SelectContent></Select></div></div>
             <div><label className="label" htmlFor="measurement-mode">Measurement mode</label><Select value={measurementMode} onValueChange={(value) => setMeasurementMode(value as MeasurementMode)}><SelectTrigger id="measurement-mode" className="w-full"><SelectValue placeholder="เลือกโหมดการวัด"/></SelectTrigger><SelectContent><SelectItem value="CT">CT</SelectItem><SelectItem value="Dental">Dental</SelectItem><SelectItem value="Radiography / Fluoroscopy">Radiography / Fluoroscopy</SelectItem></SelectContent></Select><p className="field-note">เลือกให้ตรงกับโหมดที่ตั้งใน Piranha/Ocean ก่อนเริ่ม Session</p></div>
@@ -596,10 +613,11 @@ export default function Home() {
           <div className="preset-bar"><div><strong>Scan time คงที่</strong><span>กรอกครั้งเดียวเพื่อใส่เวลาลงทั้ง 5 แถว</span></div><div className="fixed-time-control"><div className="input-with-unit"><Input aria-label="Scan time คงที่" type="number" min="0" step="any" inputMode="decimal" value={fixedScanTime} onChange={(event) => setFixedScanTime(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") applyFixedScanTime(); }} placeholder="เช่น 0.5"/><span>s</span></div><Button className="button button-primary" onClick={applyFixedScanTime} disabled={!Number.isFinite(Number(fixedScanTime)) || Number(fixedScanTime) <= 0}>ใช้กับทั้ง 5 แถว</Button><Button className="button" onClick={clearFixedScanTime}>ล้างเวลา</Button></div></div>
           <div className="export-bar"><div><strong>ส่งออกค่าที่วัดได้</strong><span>{rowsToExport.length ? `มีข้อมูล ${rowsToExport.length} รายการ • รวมค่า Calibration factor ${factor}` : "ยังไม่มีข้อมูลสำหรับส่งออก"}</span></div><div className="export-actions"><Button className="button" onClick={exportCsv} disabled={!rowsToExport.length}><Icon name="file" size={16}/>Export CSV</Button><Button className="button button-primary" onClick={exportXlsx} disabled={!rowsToExport.length}><Icon name="file" size={16}/>Export XLSX</Button></div>{exportMessage && <p className="export-message" role="status">{exportMessage}</p>}</div>
           <div className="border"><div className="table-scroll"><table className="dose-table"><thead><tr><th rowSpan={2}>ครั้งที่</th><th>kV</th><th>kV × Calibration factor</th><th>Scan time</th><th>Dose</th><th>HVL</th></tr><tr className="unit-row"><th>kV</th><th>kV</th><th>s</th><th>mGy</th><th>mm Al</th></tr></thead><tbody>{doseRows.map((row, i) => <tr key={i}><td>{i + 1}</td><td><CellInput label={`kV ครั้งที่ ${i + 1}`} value={row.kv} onChange={(value) => updateDose(i, "kv", value)}/></td><td className="calibrated">{Number(row.kv) > 0 && Number(factor) > 0 ? fmt(Number(row.kv) * Number(factor)) : "—"}</td><td><CellInput label={`Scan time ครั้งที่ ${i + 1}`} value={row.scanTime} onChange={(value) => updateDose(i, "scanTime", value)}/></td><td><CellInput label={`Dose ครั้งที่ ${i + 1}`} value={row.dose} onChange={(value) => updateDose(i, "dose", value)}/></td><td><CellInput label={`HVL ครั้งที่ ${i + 1}`} value={row.hvl} onChange={(value) => updateDose(i, "hvl", value)}/></td></tr>)}</tbody></table></div></div>
-          <div className="table-actions"><span>{validRows.length}/5 ค่าที่สมบูรณ์</span><Button className="text-button" onClick={() => { setDoseRows(Array.from({ length: 5 }, blankDoseRow)); setMeterMessage("ล้างข้อมูลแล้ว"); }}><Icon name="trash" size={15}/>ล้างตาราง</Button></div>
-          {!doseResult ? <div className="info"><Icon name="shield" size={18}/><p><strong>ต้องมีข้อมูลครบ 5 ครั้ง</strong><br/><span>ระบบจะคำนวณ Mean, sample SD และ %CV เมื่อค่าทุกช่องมากกว่า 0</span></p></div> : <><div className="result-grid three"><DoseResult label="kV × factor" data={doseResult.kv}/><DoseResult label="Scan time" data={doseResult.scan}/><DoseResult label="Dose" data={doseResult.dose}/></div><div className={`alert ${doseResult.hvlPass ? "alert-success" : "alert-error"}`}>{doseResult.hvlPass ? <Icon name="check" size={17}/> : <Icon name="x" size={17}/>}HVL เฉลี่ย {fmt(doseResult.hvlMean, 2)} mm Al — {doseResult.hvlPass ? "ผ่านเกณฑ์ทุกครั้ง (> 2.5 mm Al)" : "ไม่ผ่านเกณฑ์"}</div></>}
+          <div className="table-actions"><span>{validRows.length} แถวสมบูรณ์ • ใช้คำนวณ {calculationRows.length} แถว</span><div className="flex items-center gap-3"><Button className="button" onClick={() => meterFileRef.current?.click()}><Icon name="upload" size={15}/>นำเข้า CSV/TXT</Button><Input ref={meterFileRef} className="hidden" type="file" accept=".csv,.txt,text/csv,text/plain" onChange={(e) => handleMeterFile(e.target.files?.[0])}/><Button className="text-button" onClick={() => { setDoseRows(Array.from({ length: 5 }, blankDoseRow)); setSelectedDoseRows([0,1,2,3,4]); setMeterMessage("ล้างข้อมูลแล้ว"); }}><Icon name="trash" size={15}/>ล้างตาราง</Button></div></div>
+          {validRows.length !== 3 && validRows.length !== 5 && validRows.length > 0 && <div className="info"><Icon name="shield" size={18}/><p><strong>เลือกแถว/ชุดข้อมูลสำหรับคำนวณ 3 หรือ 5 แถว</strong><br/><span>{selectedDoseRows.length} แถวที่เลือก</span><div className="mt-2 flex flex-wrap gap-3">{doseRows.map((row, index) => validRows.includes(row) && <label key={index} className="flex items-center gap-2"><input type="checkbox" checked={selectedDoseRows.includes(index)} onChange={(event) => setSelectedDoseRows((current) => event.target.checked ? [...current, index] : current.filter((item) => item !== index))}/>แถว {index + 1}</label>)}</div></p></div>}
+          {!doseResult ? <div className="info"><Icon name="shield" size={18}/><p><strong>ต้องเลือกข้อมูลครบ 3 หรือ 5 ครั้ง</strong><br/><span>ไฟล์ที่มี 3 หรือ 5 แถวคำนวณอัตโนมัติ ส่วนจำนวนอื่นเลือกแถวเอง • คำนวณ Mean, sample SD และ %CV</span></p></div> : <><div className="result-grid three"><DoseResult label="kV × factor" data={doseResult.kv}/><DoseResult label="Scan time" data={doseResult.scan}/><DoseResult label="Dose" data={doseResult.dose}/></div><div className={`alert ${doseResult.hvlPass ? "alert-success" : "alert-error"}`}>{doseResult.hvlPass ? <Icon name="check" size={17}/> : <Icon name="x" size={17}/>}HVL เฉลี่ย {fmt(doseResult.hvlMean, 2)} mm Al — {doseResult.hvlPass ? "ผ่านเกณฑ์ทุกครั้ง (> 2.5 mm Al)" : "ไม่ผ่านเกณฑ์"}</div></>}
         </div></section>
-        <section className="card"><div className="card-header row-header"><div><h2>Meter RX diagnostics</h2><p>{measurementMode} • ตรวจสอบข้อมูลที่ส่งจากมิเตอร์หลังยิง</p></div><div className="rx-summary"><strong>{receivedBytes.toLocaleString()}</strong><span>bytes received</span></div></div><div className="card-body">{rawPackets.length ? <div className="raw-log">{rawPackets.slice().reverse().map((packet, index) => <div key={`${packet.at}-${index}`}><div><span>{new Date(packet.at).toLocaleTimeString("th-TH")}</span><strong>{packet.source}</strong><small>{packet.bytes} bytes</small></div><code>{packet.text || `(binary) ${packet.hex}`}</code>{packet.text && <code className="hex">HEX {packet.hex}</code>}</div>)}</div> : <div className="diagnostic-empty"><strong>หลังยิงแล้วยังไม่ได้รับข้อมูล</strong><span>ถ้า bytes received ยังเป็น 0 แสดงว่า Piranha ยังไม่ได้ stream มายัง session นี้ ให้เลือกโหมดเดียวกันใน Ocean/Piranha หรือใช้โปรโตคอล/SDK ของ RTI เพื่อส่งคำสั่ง Start Measurement</span></div>}</div></section>
+        <section className="card" style={{ display: "none" }}><div className="card-header row-header"><div><h2>Meter RX diagnostics</h2><p>{measurementMode} • ตรวจสอบข้อมูลที่ส่งจากมิเตอร์หลังยิง</p></div><div className="rx-summary"><strong>{receivedBytes.toLocaleString()}</strong><span>bytes received</span></div></div><div className="card-body">{rawPackets.length ? <div className="raw-log">{rawPackets.slice().reverse().map((packet, index) => <div key={`${packet.at}-${index}`}><div><span>{new Date(packet.at).toLocaleTimeString("th-TH")}</span><strong>{packet.source}</strong><small>{packet.bytes} bytes</small></div><code>{packet.text || `(binary) ${packet.hex}`}</code>{packet.text && <code className="hex">HEX {packet.hex}</code>}</div>)}</div> : <div className="diagnostic-empty"><strong>หลังยิงแล้วยังไม่ได้รับข้อมูล</strong><span>ถ้า bytes received ยังเป็น 0 แสดงว่า Piranha ยังไม่ได้ stream มายัง session นี้ ให้เลือกโหมดเดียวกันใน Ocean/Piranha หรือใช้โปรโตคอล/SDK ของ RTI เพื่อส่งคำสั่ง Start Measurement</span></div>}</div></section>
       </div> : <div className="space-y-6">
         <section className="light-toolbar card"><div className="card-header row-header"><div><h2>RTI Piranha Light Probe</h2><p>วัด Luminance และ Illuminance แบบเรียลไทม์</p></div><span className={`status ${meterStatus === "connected" ? "status-pass" : "status-fail"}`}>{meterStatus === "connected" ? "เชื่อมต่อแล้ว" : "ยังไม่เชื่อมต่อ"}</span></div><div className="card-body light-controls"><div><label className="label" htmlFor="light-mode">โหมดการวัด</label><select id="light-mode" className="input" value={lightMode} onChange={(e) => setLightMode(e.target.value as LightMode)}>{lightModes.map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}</select><p className="field-note">{lightModes.find((item) => item.value === lightMode)?.description}</p></div><div className="light-actions"><button className={`button ${lightRecording ? "button-danger" : "button-primary"}`} onClick={() => setLightRecording((value) => !value)}>{lightRecording ? "หยุดรับค่าแสง" : "เริ่มรับค่าแสง"}</button><button className="button" onClick={() => { setLightRecording(false); setLightSamples([]); }}><Icon name="trash" size={15}/>รีเซ็ต</button></div>{meterStatus !== "connected" && <div className="info"><Icon name="plug" size={18}/><p><strong>เชื่อมต่อ Piranha ก่อนเริ่มวัด</strong><br/><span>ไปที่แท็บ Meter &amp; Dose เพื่อเปิด Session เดียวกัน ข้อมูล Light Probe จะถูกส่งมายังหน้านี้อัตโนมัติ</span></p></div>}</div></section>
         <section className="light-kpis">{lightStats ? <><CurrentValue label="Realtime" value={fmt(lightStats.current, 2)} unit={lightModes.find((item) => item.value === lightMode)!.unit}/><CurrentValue label="Maximum" value={fmt(lightStats.max, 2)} unit={lightModes.find((item) => item.value === lightMode)!.unit}/><CurrentValue label="Minimum" value={fmt(lightStats.min, 2)} unit={lightModes.find((item) => item.value === lightMode)!.unit}/><CurrentValue label="Average" value={fmt(lightStats.mean, 2)} unit={lightModes.find((item) => item.value === lightMode)!.unit}/></> : <div className="light-empty-kpi">รอค่าจาก Light Probe เช่น <code>luminance=245.6</code> หรือ <code>lux=18.2</code></div>}</section>
